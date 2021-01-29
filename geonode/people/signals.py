@@ -116,7 +116,7 @@ def notify_admins_new_signup(sender, **kwargs):
     send_notification(
         users=staff,
         label="account_approve",
-        extra_context={"from_user": kwargs["user"]}
+        extra_context={"from_user": kwargs["user"], "resource": "foo"}
     )
 
     if groups_settings.AUTO_ASSIGN_REGISTERED_MEMBERS_TO_REGISTERED_MEMBERS_GROUP_AT == 'registration':
