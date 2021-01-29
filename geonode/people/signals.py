@@ -114,9 +114,9 @@ def update_user_email_addresses(sender, **kwargs):
 def notify_admins_new_signup(sender, **kwargs):
     staff = get_user_model().objects.filter(Q(is_active=True) & (Q(is_staff=True) | Q(is_superuser=True)))
     send_notification(
-        users=staff,
-        label="account_approve",
-        extra_context={"from_user": kwargs["user"], "resource": "foo"}
+        staff,
+        "account_approve",
+        {"from_user": kwargs["user"], "resource": "foo"}
     )
 
     if groups_settings.AUTO_ASSIGN_REGISTERED_MEMBERS_TO_REGISTERED_MEMBERS_GROUP_AT == 'registration':
