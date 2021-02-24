@@ -243,7 +243,7 @@ def purge_geofence_all():
                     if rules_count > 0:
                         # Delete GeoFence Rules associated to the Layer
                         # curl -X DELETE -u admin:geoserver http://<host>:<port>/geoserver/rest/geofence/rules/id/{r_id}
-                        for i, rule in enumerate(rules):
+                        for rule in rules:
                             r = requests.delete(url + 'rest/geofence/rules/id/' + str(rule['id']),
                                                 headers=headers,
                                                 auth=HTTPBasicAuth(user, passwd))
@@ -291,10 +291,11 @@ def purge_geofence_layer_rules(resource):
 
             # Delete GeoFence Rules associated to the Layer
             # curl -X DELETE -u admin:geoserver http://<host>:<port>/geoserver/rest/geofence/rules/id/{r_id}
-            for i, r_id in enumerate(r_ids):
-                r = requests.delete(url + 'rest/geofence/rules/id/' + str(r_id),
-                                    headers=headers,
-                                    auth=HTTPBasicAuth(user, passwd))
+            for r_id in r_ids:
+                r = requests.delete(
+                    url + 'rest/geofence/rules/id/' + str(r_id),
+                    headers=headers,
+                    auth=HTTPBasicAuth(user, passwd))
                 if (r.status_code < 200 or r.status_code > 201):
                     msg = "Could not DELETE GeoServer Rule for Layer "
                     msg = msg + str(resource.layer.name)
@@ -639,6 +640,10 @@ def sync_geofence_with_guardian(layer, perms, user=None, group=None, group_perms
                         _update_geofence_rule(layer, _layer_name, _layer_workspace,
                                               service, request=request, user=_user, allow=enabled)
                 _update_geofence_rule(layer, _layer_name, _layer_workspace, service, geo_limit=_wkt)
+                if service in gf_requests:
+                    for request, enabled in gf_requests[service].items():
+                        _update_geofence_rule(layer, _layer_name, _layer_workspace,
+                                              service, request=request, user=_user, allow=enabled)
             if _group:
                 logger.debug("Adding 'group' to geofence the rule: %s %s %s" % (layer, service, _group))
                 _wkt = None
@@ -649,6 +654,10 @@ def sync_geofence_with_guardian(layer, perms, user=None, group=None, group_perms
                         _update_geofence_rule(layer, _layer_name, _layer_workspace,
                                               service, request=request, group=_group, allow=enabled)
                 _update_geofence_rule(layer, _layer_name, _layer_workspace, service, group=_group, geo_limit=_wkt)
+                if service in gf_requests:
+                    for request, enabled in gf_requests[service].items():
+                        _update_geofence_rule(layer, _layer_name, _layer_workspace,
+                                              service, request=request, group=_group, allow=enabled)
     if not getattr(settings, 'DELAYED_SECURITY_SIGNALS', False):
         set_geofence_invalidate_cache()
     else:
@@ -664,7 +673,7 @@ def set_owner_permissions(resource, members=None):
         for perm in admin_perms:
             if not settings.RESOURCE_PUBLISHING and not settings.ADMIN_MODERATE_UPLOADS:
                 assign_perm(perm, resource.owner, resource.get_self_resource())
-            elif perm not in ['change_resourcebase_permissions', 'publish_resourcebase']:
+            elif perm not in {'change_resourcebase_permissions', 'publish_resourcebase'}:
                 assign_perm(perm, resource.owner, resource.get_self_resource())
             if members:
                 for user in members:
@@ -832,3 +841,19 @@ def sync_resources_with_guardian(resource=None):
                 except Exception as e:
                     logger.exception(e)
                     logger.warn("!WARNING! - Failure Synching-up Security Rules for Resource [%s]" % (r))
+
+
+def spec_perms_is_empty(perm_spec):
+    _user_empty = True
+    if 'users' in perm_spec and len(perm_spec['users']) > 0:
+        for user, perms in perm_spec['users'].items():
+            if perms and len(perms) > 0:
+                _user_empty = False
+
+    _group_empty = True
+    if 'groups' in perm_spec and len(perm_spec['groups']) > 0:
+        for group, perms in perm_spec['groups'].items():
+            if perms and len(perms) > 0:
+                _group_empty = False
+
+    return (_user_empty and _group_empty)

@@ -44,7 +44,6 @@ from django.core.files.storage import default_storage as storage
 from mptt.models import MPTTModel, TreeForeignKey
 
 from PIL import Image
-from io import BytesIO
 from resizeimage import resizeimage
 
 from imagekit.models import ImageSpecField
@@ -68,6 +67,7 @@ from geonode.base.enumerations import (
     UPDATE_FREQUENCIES,
     DEFAULT_SUPPLEMENTAL_INFORMATION)
 from geonode.utils import (
+    is_monochromatic_image,
     add_url_params,
     bbox_to_wkt,
     forward_mercator)
@@ -81,6 +81,7 @@ from geonode.notifications_helper import (
 from geonode.people.enumerations import ROLE_VALUES
 from geonode.base.thumb_utils import (
     thumb_path,
+    thumb_size,
     remove_thumbs)
 
 from pyproj import transform, Proj
@@ -867,6 +868,12 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         null=True,
         blank=True)
 
+    resource_type = models.CharField(
+        _('Resource Type'),
+        max_length=1024,
+        blank=True,
+        null=True)
+
     __is_approved = False
     __is_published = False
 
@@ -890,8 +897,11 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         return "{0}".format(self.title)
 
     def _remove_html_tags(self, attribute_str):
-        pattern = re.compile('<.*?>')
-        return re.sub(pattern, '', attribute_str)
+        try:
+            pattern = re.compile('<.*?>')
+            return re.sub(pattern, '', attribute_str)
+        except Exception:
+            return attribute_str
 
     @property
     def raw_abstract(self):
@@ -917,6 +927,10 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         """
         Send a notification when a resource is created or updated
         """
+        if not self.resource_type and self.polymorphic_ctype and \
+        self.polymorphic_ctype.model:
+            self.resource_type = self.polymorphic_ctype.model.lower()
+
         if hasattr(self, 'class_name') and (self.pk is None or notify):
             if self.pk is None and self.title:
                 # Resource Created
@@ -1119,6 +1133,15 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                 filled_fields.append(field)
         return '{}%'.format(len(filled_fields) * 100 / len(required_fields))
 
+    @property
+    def instance_is_processed(self):
+        try:
+            if hasattr(self.get_real_instance(), "processed"):
+                return self.get_real_instance().processed
+            return False
+        except Exception:
+            return False
+
     def keyword_list(self):
         return [kw.name for kw in self.keywords.all()]
 
@@ -1154,7 +1177,7 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         try:
             keywords_qs = self.get_real_instance().keywords.all()
             if keywords_qs:
-                return ','.join([kw.name for kw in keywords_qs])
+                return ','.join(kw.name for kw in keywords_qs)
             else:
                 return ''
         except Exception:
@@ -1358,14 +1381,16 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
 
         try:
             # Check that the image is valid
-            content_data = BytesIO(image)
-            im = Image.open(content_data)
-            im.verify()  # verify that it is, in fact an image
-
-            name, ext = os.path.splitext(filename)
-            remove_thumbs(name)
+            if is_monochromatic_image(None, image):
+                if not self.thumbnail_url and not image:
+                    raise Exception("Generated thumbnail image is blank")
+                else:
+                    # Skip Image creation
+                    image = None
 
             if upload_path and image:
+                name, ext = os.path.splitext(filename)
+                remove_thumbs(name)
                 actual_name = storage.save(upload_path, ContentFile(image))
                 url = storage.url(actual_name)
                 _url = urlparse(url)
@@ -1403,11 +1428,12 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                     site_url = settings.SITEURL.rstrip('/') if settings.SITEURL.startswith('http') else settings.SITEURL
                     url = urljoin(site_url, url)
 
+                if thumb_size(_upload_path) == 0:
+                    raise Exception("Generated thumbnail image is zero size")
+
                 # should only have one 'Thumbnail' link
-                _links = Link.objects.filter(resource=self, name='Thumbnail')
-                if _links and _links.count() > 1:
-                    _links.delete()
-                obj, created = Link.objects.get_or_create(
+                Link.objects.filter(resource=self, name='Thumbnail').delete()
+                obj, _created = Link.objects.get_or_create(
                     resource=self,
                     name='Thumbnail',
                     defaults=dict(
@@ -1431,7 +1457,7 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
             try:
                 Link.objects.filter(resource=self, name='Thumbnail').delete()
                 _thumbnail_url = staticfiles.static(settings.MISSING_THUMBNAIL)
-                obj, created = Link.objects.get_or_create(
+                obj, _created = Link.objects.get_or_create(
                     resource=self,
                     name='Thumbnail',
                     defaults=dict(
@@ -1458,19 +1484,6 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
            It is mandatory to call it from descendant classes
            but hard to enforce technically via signals or save overriding.
         """
-        from guardian.models import UserObjectPermission
-        logger.debug('Checking for permissions.')
-        #  True if every key in the get_all_level_info dict is empty.
-        no_custom_permissions = UserObjectPermission.objects.filter(
-            content_type=ContentType.objects.get_for_model(
-                self.get_self_resource()), object_pk=str(
-                self.pk)).exists()
-
-        if not no_custom_permissions:
-            logger.debug(
-                'There are no permissions for this object, setting default perms.')
-            self.set_default_permissions()
-
         user = None
         if self.owner:
             user = self.owner
@@ -1486,13 +1499,24 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
             if self.metadata_author is None:
                 self.metadata_author = user
 
+        from guardian.models import UserObjectPermission
+        logger.debug('Checking for permissions.')
+        #  True if every key in the get_all_level_info dict is empty.
+        no_custom_permissions = UserObjectPermission.objects.filter(
+            content_type=ContentType.objects.get_for_model(
+                self.get_self_resource()), object_pk=str(
+                self.pk)).exists()
+
+        if not no_custom_permissions:
+            logger.debug(
+                'There are no permissions for this object, setting default perms.')
+            self.set_default_permissions(owner=user)
+
     def maintenance_frequency_title(self):
-        return [v for i, v in enumerate(
-            UPDATE_FREQUENCIES) if v[0] == self.maintenance_frequency][0][1].title()
+        return [v for v in UPDATE_FREQUENCIES if v[0] == self.maintenance_frequency][0][1].title()
 
     def language_title(self):
-        return [v for i, v in enumerate(
-            ALL_LANGUAGES) if v[0] == self.language][0][1].title()
+        return [v for v in ALL_LANGUAGES if v[0] == self.language][0][1].title()
 
     def _set_poc(self, poc):
         # reset any poc assignation to this resource
