@@ -22,7 +22,6 @@ import os
 import sys
 import logging
 import shutil
-import base64
 import traceback
 from types import TracebackType
 import decimal
@@ -31,9 +30,9 @@ from django.db.models import Q
 from urllib.parse import quote
 
 from django.http import Http404
-from django.contrib.gis.geos import GEOSGeometry
 from django.core.exceptions import PermissionDenied
 from django.template.response import TemplateResponse
+from django.views.decorators.clickjacking import xframe_options_exempt
 from requests import Request
 from itertools import chain
 from owslib.wfs import WebFeatureService
@@ -48,6 +47,8 @@ from django.shortcuts import render
 from django.conf import settings
 from django.utils.translation import ugettext as _
 from django.views.decorators.http import require_http_methods
+
+from geonode.thumbs.thumbnails import create_thumbnail
 
 from dal import autocomplete
 
@@ -112,10 +113,7 @@ from geonode.tasks.tasks import set_permissions
 from celery.utils.log import get_logger
 
 if check_ogc_backend(geoserver.BACKEND_PACKAGE):
-    from geonode.geoserver.helpers import (
-        _render_thumbnail,
-        _prepare_thumbnail_body_from_opts,
-        gs_catalog)
+    from geonode.geoserver.helpers import gs_catalog
 
 CONTEXT_LOG_FILE = ogc_server_settings.LOG_FILE
 
@@ -312,10 +310,13 @@ def layer_upload_handle_post(request, template):
                 except TypeError:
                     upload_session.traceback = traceback.format_tb(tb)
                 upload_session.context = log_snippet(CONTEXT_LOG_FILE)
-                upload_session.save()
-                out['traceback'] = upload_session.traceback
-                out['context'] = upload_session.context
-                out['upload_session'] = upload_session.id
+                try:
+                    upload_session.save()
+                    out['traceback'] = upload_session.traceback
+                    out['context'] = upload_session.context
+                    out['upload_session'] = upload_session.id
+                except Exception as e:
+                    logger.debug(e)
             else:
                 # Prevent calls to None
                 if saved_layer:
@@ -380,7 +381,7 @@ def layer_upload_handle_post(request, template):
             if isinstance(out[_k], str):
                 out[_k] = surrogate_escape_string(out[_k], layer_charset)
             elif isinstance(out[_k], dict):
-                for key, value in out[_k].items():
+                for key, value in out[_k].copy().items():
                     try:
                         item = out[_k][key]
                         # Ref issue #4241
@@ -700,16 +701,6 @@ def layer_detail(request, layername, template='layers/layer_detail.html'):
         'DEFAULT_MAP_CRS',
         'EPSG:3857')
 
-    # provide bbox in EPSG:4326 for leaflet
-    if context_dict["preview"] == 'leaflet':
-        try:
-            srid, wkt = layer.geographic_bounding_box.split(';')
-            srid = re.findall(r'\d+', srid)
-            geom = GEOSGeometry(wkt, srid=int(srid[0]))
-            geom.transform(4326)
-            context_dict["layer_bbox"] = ','.join([str(c) for c in geom.extent])
-        except Exception:
-            pass
     if layer.storeType == 'dataStore':
         links = layer.link_set.download().filter(
             Q(name__in=settings.DOWNLOAD_FORMATS_VECTOR) |
@@ -1019,6 +1010,7 @@ def layer_metadata(
                 content_type='application/json',
                 status=400)
         tkeywords_form = TKeywordForm(request.POST)
+        #  set initial values for thesaurus form
         if not tkeywords_form.is_valid():
             logger.error(f"Layer Thesauri Keywords form is not valid: {tkeywords_form.errors}")
             out = {
@@ -1156,14 +1148,17 @@ def layer_metadata(
             if not tkeywords_form.is_valid():
                 return HttpResponse(json.dumps({'message': "Invalid thesaurus keywords"}, status_code=400))
 
-            tkeywords_data = tkeywords_form.cleaned_data['tkeywords']
-
             thesaurus_setting = getattr(settings, 'THESAURUS', None)
             if thesaurus_setting:
+                tkeywords_data = tkeywords_form.cleaned_data['tkeywords']
                 tkeywords_data = tkeywords_data.filter(
                     thesaurus__identifier=thesaurus_setting['name']
                 )
                 layer.tkeywords.set(tkeywords_data)
+            elif Thesaurus.objects.all().exists():
+                fields = tkeywords_form.cleaned_data
+                layer.tkeywords.set(tkeywords_form.cleanx(fields))
+
         except Exception:
             tb = traceback.format_exc()
             logger.error(tb)
@@ -1478,50 +1473,23 @@ def layer_thumbnail(request, layername):
         raise Http404(_("Not found"))
 
     try:
-        try:
-            preview = json.loads(request.body).get('preview', None)
-        except Exception as e:
-            logger.debug(e)
-            preview = None
+        request_body = json.loads(request.body)
+        bbox = request_body['bbox'] + [request_body['srid']]
+        zoom = request_body.get('zoom', None)
 
-        if preview and preview == 'react':
-            format, image = json.loads(
-                request.body)['image'].split(';base64,')
-            image = base64.b64decode(image)
-        else:
-            image = None
-            try:
-                image = _prepare_thumbnail_body_from_opts(
-                    request.body, request=request)
-            except Exception as e:
-                logger.debug(e)
-                try:
-                    image = _render_thumbnail(request.body)
-                except Exception as e:
-                    logger.debug(e)
-                    image = None
-
-        is_image = False
-        if image:
-            import imghdr
-            for th in imghdr.tests:
-                is_image = th(image, None)
-                if is_image:
-                    break
-
-        if not is_image:
-            return HttpResponse(
-                content=_('couldn\'t generate thumbnail'),
-                status=500,
-                content_type='text/plain'
-            )
-        filename = "layer-%s-thumb.png" % layer_obj.uuid
-        layer_obj.save_thumbnail(filename, image)
+        create_thumbnail(
+            layer_obj,
+            bbox=bbox,
+            background_zoom=zoom,
+            overwrite=True
+        )
 
         return HttpResponse('Thumbnail saved')
+
     except Exception as e:
+        logger.exception(e)
         return HttpResponse(
-            content='error saving thumbnail: %s' % str(e),
+            content=_('couldn\'t generate thumbnail: %s' % str(e)),
             status=500,
             content_type='text/plain'
         )
@@ -1554,10 +1522,10 @@ def get_layer(request, layername):
             'title': layer_obj.title,
             'url': layer_obj.get_tiles_url(),
             'bbox_string': layer_obj.bbox_string,
-            'bbox_x0': layer_obj.bbox_x0,
-            'bbox_x1': layer_obj.bbox_x1,
-            'bbox_y0': layer_obj.bbox_y0,
-            'bbox_y1': layer_obj.bbox_y1,
+            'bbox_x0': layer_obj.bbox_helper.xmin,
+            'bbox_x1': layer_obj.bbox_helper.xmax,
+            'bbox_y0': layer_obj.bbox_helper.ymin,
+            'bbox_y1': layer_obj.bbox_helper.ymax,
         }
         return HttpResponse(
             json.dumps(
@@ -1659,6 +1627,14 @@ def layer_sld_edit(
         request,
         layername,
         template='layers/layer_style_edit.html'):
+    return layer_detail(request, layername, template)
+
+
+@xframe_options_exempt
+def layer_embed(
+        request,
+        layername,
+        template='layers/layer_embed.html'):
     return layer_detail(request, layername, template)
 
 

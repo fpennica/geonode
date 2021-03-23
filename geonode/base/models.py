@@ -22,6 +22,7 @@ import os
 import re
 import math
 import uuid
+import html
 import logging
 import traceback
 
@@ -40,7 +41,7 @@ from django.utils.translation import ugettext_lazy as _
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.staticfiles.templatetags import staticfiles
 from django.core.files.storage import default_storage as storage
-
+from django.utils.html import strip_tags
 from mptt.models import MPTTModel, TreeForeignKey
 
 from PIL import Image, ImageOps
@@ -896,11 +897,16 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
         return "{0}".format(self.title)
 
     def _remove_html_tags(self, attribute_str):
+        _attribute_str = attribute_str
         try:
             pattern = re.compile('<.*?>')
-            return re.sub(pattern, '', attribute_str)
+            _attribute_str = html.unescape(
+                re.sub(pattern, '', attribute_str).replace('\n', ' ').replace('\r', '').strip())
         except Exception:
-            return attribute_str
+            if attribute_str:
+                _attribute_str = html.unescape(
+                    attribute_str.replace('\n', ' ').replace('\r', '').strip())
+        return strip_tags(_attribute_str)
 
     @property
     def raw_abstract(self):
@@ -1403,7 +1409,7 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                             storage.path(_upload_path)
                         )
                     except Exception as e:
-                        logger.debug(e)
+                        logger.exception(e)
 
                 try:
                     # Optimize the Thumbnail size and resolution
@@ -1414,9 +1420,9 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                         (_default_thumb_size['width'], _default_thumb_size['height']),
                         resample=Image.ANTIALIAS)
                     cover = ImageOps.fit(im, (_default_thumb_size['width'], _default_thumb_size['height']))
-                    cover.save(storage.path(_upload_path), format='JPEG')
+                    cover.save(storage.path(_upload_path), format='PNG')
                 except Exception as e:
-                    logger.debug(e)
+                    logger.exception(e)
 
                 # check whether it is an URI or not
                 parsed = urlsplit(url)
@@ -1447,10 +1453,10 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                     thumbnail_url=url
                 )
         except Exception as e:
-            logger.debug(
-                'Error when generating the thumbnail for resource %s. (%s)' %
-                (self.id, str(e)))
-            logger.warn('Check permissions for file %s.' % upload_path)
+            logger.error(
+                f'Error when generating the thumbnail for resource {self.id}. ({e})'
+            )
+            logger.error(f'Check permissions for file {upload_path}.')
             try:
                 Link.objects.filter(resource=self, name='Thumbnail').delete()
                 _thumbnail_url = staticfiles.static(settings.MISSING_THUMBNAIL)
@@ -1471,9 +1477,9 @@ class ResourceBase(PolymorphicModel, PermissionLevelMixin, ItemBase):
                     thumbnail_url=_thumbnail_url
                 )
             except Exception as e:
-                logger.debug(
-                    'Error when generating the thumbnail for resource %s. (%s)' %
-                    (self.id, str(e)))
+                logger.error(
+                    f'Error when generating the thumbnail for resource {self.id}. ({e})'
+                )
 
     def set_missing_info(self):
         """Set default permissions and point of contacts.

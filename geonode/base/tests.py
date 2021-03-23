@@ -19,8 +19,11 @@
 #########################################################################
 
 import os
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from urllib.parse import urlparse
+
+import requests
+from django.core.exceptions import ObjectDoesNotExist
 
 from guardian.shortcuts import assign_perm, get_perms
 from imagekit.cachefiles.backends import Simple
@@ -40,7 +43,10 @@ from geonode.base.models import (
     Menu,
     MenuItem,
     Configuration,
-    TopicCategory)
+    TopicCategory,
+    Thesaurus,
+    ThesaurusKeyword
+)
 from django.conf import settings
 from django.template import Template, Context
 from django.contrib.auth import get_user_model
@@ -50,7 +56,12 @@ from django.shortcuts import reverse
 
 from geonode.base.middleware import ReadOnlyMiddleware, MaintenanceMiddleware
 from geonode.base.models import CuratedThumbnail
-from geonode.base.templatetags.base_tags import get_visibile_resources
+from geonode.base.templatetags.base_tags import get_visibile_resources, facets
+from geonode.base.templatetags.thesaurus import (
+    get_name_translation, get_unique_thesaurus_set,
+    get_thesaurus_title,
+    get_thesaurus_date,
+)
 from geonode.base.templatetags.user_messages import show_notification
 from geonode import geoserver
 from geonode.decorators import on_ogc_backend
@@ -58,6 +69,8 @@ from geonode.decorators import on_ogc_backend
 from django.core.files import File
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from geonode.base.forms import ThesaurusAvailableForm
+
 
 test_image = Image.new('RGBA', size=(50, 50), color=(155, 0, 0))
 
@@ -67,6 +80,9 @@ class ThumbnailTests(GeoNodeBaseTestSupport):
     def setUp(self):
         super(ThumbnailTests, self).setUp()
         self.rb = ResourceBase.objects.create()
+
+    def tearDown(self):
+        super().tearDown()
 
     def test_initial_behavior(self):
         """
@@ -89,9 +105,15 @@ class ThumbnailTests(GeoNodeBaseTestSupport):
         """
         Tests that an monochromatic image does not change the current resource thumbnail.
         """
+        filename = 'test-thumb'
+
         current = self.rb.get_thumbnail_url()
-        self.rb.save_thumbnail('test-thumb', image)
+        self.rb.save_thumbnail(filename, image)
         self.assertEqual(current, urlparse(self.rb.get_thumbnail_url()).path)
+
+        # cleanup: remove saved thumbnail
+        thumb_utils.remove_thumbs(filename)
+        self.assertFalse(thumb_utils.thumb_exists(filename))
 
     @patch('PIL.Image.open', return_value=test_image)
     def test_thumb_utils_methods(self, image):
@@ -108,6 +130,10 @@ class ThumbnailTests(GeoNodeBaseTestSupport):
         storage.save(upload_path, File(f))
         self.assertTrue(thumb_utils.thumb_exists(filename))
         self.assertEqual(thumb_utils.thumb_size(upload_path), 10000)
+
+        # cleanup: remove saved thumbnail
+        thumb_utils.remove_thumbs(filename)
+        self.assertFalse(thumb_utils.thumb_exists(filename))
 
 
 class TestThumbnailUrl(GeoNodeBaseTestSupport):
@@ -873,9 +899,147 @@ class TestHtmlTagRemoval(SimpleTestCase):
 
     def test_complex_tags_in_attribute(self):
         tagged_value = """<p style="display:none;" id="test">This is not a templated text<p>
-        <div class="test_css">Something in container</div>"""
-        attribute_target_value = """This is not a templated text
-        Something in container"""
+        <div class="test_css">Something in &iacute;container</div> <p>&pound;682m</p>"""
+        attribute_target_value = """This is not a templated text         Something in ícontainer £682m"""
         r = ResourceBase()
         filtered_value = r._remove_html_tags(tagged_value)
         self.assertEqual(filtered_value, attribute_target_value)
+
+    def test_converted_html_in_tags_with_char_references(self):
+        tagged_value = """<p>&lt;p&gt;Abstract value &amp; some text&lt;/p&gt;</p>"""
+        attribute_target_value = """Abstract value & some text"""
+        r = ResourceBase()
+        filtered_value = r._remove_html_tags(tagged_value)
+        self.assertEqual(filtered_value, attribute_target_value)
+
+    def test_converted_html_in_tags_with_with_multiple_tags(self):
+        tagged_value = """<p><p><p><p>Abstract value &amp; some text</p></p></p></p>"""
+        attribute_target_value = """Abstract value & some text"""
+        r = ResourceBase()
+        filtered_value = r._remove_html_tags(tagged_value)
+        self.assertEqual(filtered_value, attribute_target_value)
+
+class TestTagThesaurus(TestCase):
+    #  loading test thesausurs
+    fixtures = [
+        "test_thesaurus.json"
+    ]
+
+    def setUp(self):
+        self.sut = Thesaurus(
+            identifier="foo_name",
+            title="GEMET - INSPIRE themes, version 1.0",
+            date="2018-05-23T10:25:56",
+            description="GEMET - INSPIRE themes, version 1.0",
+            slug="",
+            about="http://inspire.ec.europa.eu/theme",
+        )
+        self.tkeywords = ThesaurusKeyword.objects.all()
+
+    def test_get_unique_thesaurus_list(self):
+        tid = self.__get_last_thesaurus().id
+        actual = get_unique_thesaurus_set(self.tkeywords)
+        self.assertSetEqual({tid}, actual)
+
+    def test_get_thesaurus_title(self):
+        tid = self.__get_last_thesaurus().id
+        actual = get_thesaurus_title(tid)
+        self.assertEqual(self.sut.title, actual)
+
+    def test_get_thesaurus_date(self):
+        tid = self.__get_last_thesaurus().id
+        actual = get_thesaurus_date(tid)
+        self.assertEqual(self.sut.date, actual)
+
+    def test_get_name_translation_raise_exception_if_identifier_does_not_exists(self):
+        with self.assertRaises(ObjectDoesNotExist):
+            get_name_translation('foo_indentifier')
+
+    @patch('geonode.base.templatetags.thesaurus.get_language')
+    def test_get_name_translation_return_thesauro_title_if_label_for_selected_language_does_not_exists(self, lang):
+        lang.return_value = 'ke'
+        actual = get_name_translation('inspire-theme')
+        expected = "GEMET - INSPIRE themes, version 1.0"
+        self.assertEqual(expected, actual)
+
+    @patch('geonode.base.templatetags.thesaurus.get_language')
+    def test_get_name_translation_return_label_title_if_label_for_selected_language_exists(self, lang):
+        lang.return_value = 'it'
+        actual = get_name_translation('inspire-theme')
+        expected = "Tema GEMET - INSPIRE, versione 1.0"
+        self.assertEqual(expected, actual)
+
+    @staticmethod
+    def __get_last_thesaurus():
+        return Thesaurus.objects.all().order_by("-id")[0]
+
+
+@override_settings(THESAURUS_DEFAULT_LANG="en")
+class TestThesaurusAvailableForm(TestCase):
+    #  loading test thesausurs
+    fixtures = [
+        "test_thesaurus.json"
+    ]
+
+    def setUp(self):
+        self.sut = ThesaurusAvailableForm
+
+    def test_form_is_invalid_if_required_fields_are_missing(self):
+        actual = self.sut(data={})
+        self.assertFalse(actual.is_valid())
+
+    def test_form_is_invalid_if_fileds_send_unexpected_values(self):
+        actual = self.sut(data={"1": [1, 2]})
+        self.assertFalse(actual.is_valid())
+
+    def test_form_is_valid_if_fileds_send_expected_values(self):
+        actual = self.sut(data={"1": 1})
+        self.assertTrue(actual.is_valid())
+
+
+class TestFacets(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create(username='test', email='test@test.com')
+        Layer.objects.create(
+            owner=self.user, title='test_boxes', abstract='nothing', storeType='dataStore', is_approved=True
+        )
+        Layer.objects.create(
+            owner=self.user, title='test_1', abstract='contains boxes', storeType='dataStore', is_approved=True
+        )
+        Layer.objects.create(
+            owner=self.user, title='test_2', purpose='contains boxes', storeType='dataStore', is_approved=True
+        )
+        Layer.objects.create(
+            owner=self.user, title='test_3', storeType='dataStore', is_approved=True
+        )
+
+        Layer.objects.create(
+            owner=self.user, title='test_boxes', abstract='nothing', storeType='coverageStore', is_approved=True
+        )
+        Layer.objects.create(
+            owner=self.user, title='test_1', abstract='contains boxes', storeType='coverageStore', is_approved=True
+        )
+        Layer.objects.create(
+            owner=self.user, title='test_2', purpose='contains boxes', storeType='coverageStore', is_approved=True
+        )
+        Layer.objects.create(
+            owner=self.user, title='test_boxes', storeType='coverageStore', is_approved=True
+        )
+
+        self.request_mock = Mock(spec=requests.Request, GET=Mock())
+
+    def test_facets_filter_layers_returns_correctly(self):
+        self.request_mock.GET.get.side_effect = lambda key, self: {
+            'title__icontains': 'boxes',
+            'abstract__icontains': 'boxes',
+            'purpose__icontains': 'boxes',
+            'date__gte': None,
+            'date__range': None,
+            'date__lte': None,
+            'extent': None
+        }.get(key)
+        self.request_mock.GET.getlist.return_value = None
+        self.request_mock.user = self.user
+        results = facets({'request': self.request_mock})
+        self.assertEqual(results['vector'], 3)
+        self.assertEqual(results['raster'], 4)
