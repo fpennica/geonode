@@ -34,7 +34,7 @@ dependencies = [
     "hyperlink==21.0.0",
     "urllib3==2.7.0",
     "python-slugify==8.0.4",
-    "decorator==5.1.1",
+    "decorator==5.3.1",
     "celery==5.6.3",
     "Deprecated==1.2.14",
     "jsonschema==4.22.0",
